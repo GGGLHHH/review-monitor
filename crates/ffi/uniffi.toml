@@ -1,0 +1,3 @@
+[bindings.kotlin]
+package_name = "com.reviewmonitor.core"
+cdylib_name = "rm_ffi"

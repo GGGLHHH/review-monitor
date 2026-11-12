@@ -6,3 +6,17 @@ target/
 
 # 编译产物（exe 从源码构建，不进库；dist/说明.md 保留）
 dist/*.exe
+
+# 安卓
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.kotlin/
+android/app/src/main/assets/poller.js
+android/app/src/main/assets/login.js
+android/app/src/main/jniLibs/
+*.keystore
+*.jks
+dist/*.apk
+android/app/src/main/java/com/reviewmonitor/core/

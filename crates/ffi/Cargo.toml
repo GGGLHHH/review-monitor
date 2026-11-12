@@ -1,0 +1,35 @@
+[package]
+name = "rm-ffi"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "rm-core 的 UniFFI 门面（安卓用）"
+
+[lib]
+name = "rm_ffi"
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["cli"]
+
+[features]
+cli = ["uniffi/cli"]
+
+[dependencies]
+rm-core = { path = "../core" }
+uniffi = "0.32"
+anyhow.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+paranoid-android = "0.2"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true

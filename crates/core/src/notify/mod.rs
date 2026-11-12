@@ -75,6 +75,7 @@ impl Dispatcher {
 
     /// 按配置里启用的 id 构建渠道
     pub fn build(enabled: &[String]) -> Self {
+        #[cfg_attr(not(windows), allow(unused_mut))]
         let mut v: Vec<Box<dyn Notifier>> = Vec::new();
         for id in enabled {
             match id.as_str() {

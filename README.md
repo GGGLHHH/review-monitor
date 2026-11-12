@@ -4,7 +4,20 @@
 
 数据来源是美团经营宝网页版（`ecom.meituan.com`）的评价页：程序里嵌了一个浏览器，你在里面登录一次，之后程序在页面里按间隔调用评价列表接口。
 
-## 运行
+只监控你自己的门店、用你自己的账号；纯本地运行，没有服务器，数据不上传。Windows 版和安卓版各自独立（各自登录、各自检查、各自提醒）。
+
+## 安卓版
+
+源码在 `android/`（Kotlin + Compose 界面，检查逻辑复用 `crates/core`，通过 `crates/ffi` 的 UniFFI 绑定调用）。使用说明见 `dist/安卓说明.md`，设计见 `docs/superpowers/specs/2026-11-12-review-monitor-android-design.md`。
+
+```bash
+bash android/build-rust.sh              # 编译 Rust 库（需要 Android NDK 和 cargo-ndk）并生成 Kotlin 绑定
+cd android && ./gradlew assembleRelease # 产物：android/app/build/outputs/apk/release/app-release.apk
+```
+
+登录在应用自己的登录页完成；美团的滑块验证需要你自己拖，程序不会代做。
+
+## 运行（Windows）
 
 ```powershell
 cargo run -p review-monitor            # 调试版，带控制台日志
@@ -118,3 +131,7 @@ web/poller.js  注入页面的脚本，只负责代发请求、回传原始 JSON
 - 不调用回复、申诉等任何写接口。
 - 不自动登录、不拖滑块、不读取你浏览器里的 Cookie。
 - 只看登录账号名下的门店。
+
+## 许可
+
+MIT，见 `LICENSE`。本项目与美团、大众点评没有关联；请只用于你自己有权访问的门店后台，并遵守平台的服务协议。

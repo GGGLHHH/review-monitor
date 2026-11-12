@@ -21,6 +21,10 @@ const NO_FRAME_LIMIT: u32 = 6;
 const LOGIN_PROBE_EVERY: Duration = Duration::from_secs(15);
 const FLUSH_EVERY: Duration = Duration::from_secs(60);
 const FIRST_CHECK_DELAY: Duration = Duration::from_secs(6);
+/// state 表里记「已经发过需要重新登录」，空串表示没有
+const LOGIN_LOST_KEY: &str = "login_lost_notified";
+/// LOGIN_LOST_KEY 的特殊值：用户主动退出登录（不算掉线，不提醒，重新登录也不发「已恢复」）
+const MANUAL_LOGOUT: &str = "manual";
 
 /// 宿主要代发的请求
 #[derive(Debug, Clone, PartialEq)]
@@ -28,6 +32,36 @@ pub enum Call {
     Whoami,
     Pois,
     List { platform: Platform, body: String },
+}
+
+/// 经营宝评价页（各端 WebView 的起始地址）
+pub const START_URL: &str = "https://ecom.meituan.com/meishi/?cate=6103#https://ecom.meituan.com/emis/evaluation/poi";
+
+impl Call {
+    /// 让页面里的 poller.js 代发这个请求的 JS。`__rm` 还没注入（页面没载完）时，
+    /// 按「不在评价页」回报，由 poller 稍后重试。电脑版和安卓版共用。
+    pub fn to_js(&self, req_id: &str) -> String {
+        let req = serde_json::to_string(req_id).unwrap_or_default();
+        let inner = match self {
+            Call::Whoami => format!("window.__rm.whoami({req})"),
+            Call::Pois => format!("window.__rm.poiList({req})"),
+            Call::List { platform, body } => {
+                format!("window.__rm.fetchList({req},{},{body})", serde_json::to_string(platform.js_name()).unwrap_or_default())
+            }
+        };
+        format!(
+            "if(window.__rm){{{inner}}}else{{try{{window.ipc.postMessage(JSON.stringify({{reqId:{req},kind:'none',error:'no_iframe',href:location.href}}))}}catch(e){{}}}}"
+        )
+    }
+}
+
+/// 在评价页里定位一条评价并高亮（结果以 kind=reveal 的消息回传）
+pub fn reveal_js(platform: Platform, feedback_id: i64) -> String {
+    format!(
+        "if(window.__rm&&window.__rm.reveal){{window.__rm.reveal('{}','{feedback_id}')}}\
+         else{{window.ipc.postMessage(JSON.stringify({{kind:'reveal',error:'no_rm',href:location.href}}))}}",
+        platform.js_name()
+    )
 }
 
 /// 宿主（WebView）能力
@@ -154,6 +188,19 @@ impl Poller {
             State::LoginLost { next_probe, .. } => { *next_probe = now; }
             State::Running(_) => {}
         }
+    }
+
+    /// 用户主动退出登录（界面已清掉登录状态）。监控暂停，等重新登录；不发任何提醒。
+    pub fn logout(&mut self, now: Instant, _now_ms: i64) {
+        let _ = self.store.set_state(LOGIN_LOST_KEY, MANUAL_LOGOUT);
+        self.state = State::LoginLost { next_probe: now + LOGIN_PROBE_EVERY, probe: None };
+        self.failures = 0;
+        self.no_frame = 0;
+        self.status.login = Login::Out;
+        self.status.busy = false;
+        self.status.next_at = None;
+        self.status.message = "已退出登录，登录后继续监控".into();
+        self.attention = true;
     }
 
     fn next_req(&mut self) -> String {
@@ -325,7 +372,7 @@ impl Poller {
         let body = msg.body.as_deref().unwrap_or("");
         match step {
             Step::Whoami => {
-                if whoami_ok(msg) { self.status.login = Login::In; }
+                if whoami_ok(msg) { self.status.login = Login::In; self.settle_login_lost(); }
                 else { self.enter_login_lost(now, now_ms); }
             }
             Step::Pois => {
@@ -409,22 +456,36 @@ impl Poller {
         self.status.next_at = None;
         self.status.message = "需要登录：请在「后台页面」里登录（滑块请手动拖）".into();
         self.attention = true;
-        if was != Login::Out {
+        // 一次掉线只提醒一次：标记存库里，程序被系统杀掉重启也不会再弹（手机上很常见）
+        let notified = self.store.get_state(LOGIN_LOST_KEY).ok().flatten().is_some_and(|v| !v.is_empty());
+        // 从没成功检查过（刚装好、还没登录过）：界面本来就停在登录页，不算「登录失效」，不提醒
+        let ever = self.store.get_state("initialized").ok().flatten().is_some();
+        if was != Login::Out && !notified && ever {
+            let _ = self.store.set_state(LOGIN_LOST_KEY, &_now_ms.to_string());
             self.disp.system(&Alert::system(AlertKind::LoginLost, "差评监控：需要重新登录",
-                "后台登录已失效，监控已暂停。请打开程序，在「后台页面」里登录。"));
+                "后台登录已失效，监控已暂停。请打开程序登录。"));
         }
     }
 
     fn login_restored(&mut self, now: Instant, _now_ms: i64) {
-        let was_known = self.store.get_state("initialized").ok().flatten().is_some();
         self.status.login = Login::In;
         self.attention = false;
-        if was_known {
-            self.disp.system(&Alert::system(AlertKind::LoginRestored, "差评监控：已恢复", "登录成功，监控已恢复，正在补查掉线期间的评价。"));
-        }
+        self.settle_login_lost();
         // 立刻检查；窗口从上次成功时间开始，补上掉线期间
         self.schedule_next(now, Duration::from_secs(2));
         self.status.message = "已登录，马上检查…".into();
+    }
+
+    /// 确认已登录：清掉「已提醒掉线」的标记，下次掉线才会再提醒。
+    /// 只有发过「需要重新登录」才发「已恢复」，两条成对出现——包括掉线后程序被杀、重启时已经登录好了的情况。
+    fn settle_login_lost(&mut self) {
+        let notified = self.store.get_state(LOGIN_LOST_KEY).ok().flatten().is_some_and(|v| !v.is_empty());
+        if !notified { return; }
+        let manual = self.store.get_state(LOGIN_LOST_KEY).ok().flatten().as_deref() == Some(MANUAL_LOGOUT);
+        let _ = self.store.set_state(LOGIN_LOST_KEY, "");
+        if !manual && self.store.get_state("initialized").ok().flatten().is_some() {
+            self.disp.system(&Alert::system(AlertKind::LoginRestored, "差评监控：已恢复", "登录成功，监控已恢复，正在补查掉线期间的评价。"));
+        }
     }
 
     fn flush(&mut self, now: Instant, now_ms: i64) {
@@ -471,6 +532,28 @@ pub fn extract_pois(body: &str) -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(v) = serde_json::from_str(body) { walk(&v, &mut out); }
     out
+}
+
+#[cfg(test)]
+mod js_tests {
+    use super::*;
+
+    #[test]
+    fn call_js_shapes() {
+        let w = Call::Whoami.to_js("r1");
+        assert!(w.contains(r#"window.__rm.whoami("r1")"#), "{w}");
+        assert!(w.contains(r#"reqId:"r1",kind:'none',error:'no_iframe'"#), "{w}");
+        let l = Call::List { platform: Platform::Dianping, body: r#"{"pageNo":1}"#.into() }.to_js("r2");
+        assert!(l.contains(r#"window.__rm.fetchList("r2","dianping",{"pageNo":1})"#), "{l}");
+        // reqId 里的引号会被转义，不会拼出坏 JS
+        assert!(Call::Pois.to_js("a\"b").contains(r#"poiList("a\"b")"#));
+    }
+
+    #[test]
+    fn reveal_js_shape() {
+        let j = reveal_js(Platform::Meituan, 10578232696);
+        assert!(j.contains("window.__rm.reveal('meituan','10578232696')"), "{j}");
+    }
 }
 
 #[cfg(test)]
@@ -614,6 +697,102 @@ mod tests {
         assert!(h.titles().contains(&"差评监控：已恢复".to_string()));
         h.adv(3);
         assert_eq!(h.page.last().1, Call::Whoami, "恢复后马上开始新一轮");
+    }
+
+    #[test]
+    fn login_lost_alert_survives_restart() {
+        // 掉线 → 进程被杀 → 重启后仍在登录页：不再重复提醒
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("d.db");
+        let login_nav = || IpcMsg { kind: "nav".into(), login: Some(true), ..Default::default() };
+        let alerts = Arc::new(Mutex::new(vec![]));
+        let mk = |a: &Arc<Mutex<Vec<Alert>>>| {
+            Poller::new(Config::default(), Store::open(&db).unwrap(), Dispatcher::new(vec![Box::new(Rec(a.clone()))]), Instant::now())
+        };
+        let page = FakePage::default();
+        let mut p = mk(&alerts);
+        let _ = p.store.set_state("initialized", "1");
+        p.on_msg(&login_nav(), &page, Instant::now(), 0);
+        assert_eq!(alerts.lock().unwrap().len(), 1);
+        drop(p);
+        for _ in 0..3 {
+            let mut p = mk(&alerts);
+            p.on_msg(&login_nav(), &page, Instant::now(), 0);
+            assert_eq!(p.status.login, Login::Out);
+        }
+        assert_eq!(alerts.lock().unwrap().len(), 1, "重启 3 次只提醒过 1 次");
+
+        // 再重启时已经登录好了（正常检查里 whoami 成功）→ 发「已恢复」并清标记；之后再掉线要重新提醒
+        let mut p = mk(&alerts);
+        let t = Instant::now() + Duration::from_secs(10);
+        p.tick(&page, t, 0);
+        let (req, call) = page.last();
+        assert_eq!(call, Call::Whoami);
+        p.on_msg(&reply(&req, "whoami", WHO), &page, t, 0);
+        assert_eq!(p.status.login, Login::In);
+        p.on_msg(&login_nav(), &page, t, 0);
+        let titles: Vec<String> = alerts.lock().unwrap().iter().map(|a| a.title.clone()).collect();
+        assert_eq!(titles, ["差评监控：需要重新登录", "差评监控：已恢复", "差评监控：需要重新登录"]);
+    }
+
+    #[test]
+    fn fresh_install_does_not_alert_login_lost() {
+        // 全新安装、从没登录过：停在登录页不弹「需要重新登录」；登录成功后也不弹「已恢复」
+        let mut h = H::new();
+        h.feed(IpcMsg { kind: "nav".into(), login: Some(true), ..Default::default() });
+        assert_eq!(h.p.status.login, Login::Out);
+        assert!(h.alerts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn manual_logout_is_silent_and_rearms() {
+        // 主动退出：不弹「需要重新登录」，重启后也不弹；重新登录不弹「已恢复」；之后真掉线照常提醒
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("d.db");
+        let login_nav = || IpcMsg { kind: "nav".into(), login: Some(true), ..Default::default() };
+        let alerts = Arc::new(Mutex::new(vec![]));
+        let mk = |a: &Arc<Mutex<Vec<Alert>>>| {
+            Poller::new(Config::default(), Store::open(&db).unwrap(), Dispatcher::new(vec![Box::new(Rec(a.clone()))]), Instant::now())
+        };
+        let page = FakePage::default();
+        let mut p = mk(&alerts);
+        let _ = p.store.set_state("initialized", "1");
+        let t = Instant::now();
+        p.logout(t, 0);
+        assert_eq!(p.status.login, Login::Out);
+        assert!(!p.status.busy);
+        p.on_msg(&login_nav(), &page, t, 0);
+        drop(p);
+        let mut p = mk(&alerts);
+        p.on_msg(&login_nav(), &page, t, 0);
+        assert!(alerts.lock().unwrap().is_empty(), "主动退出不提醒，重启后也不提醒");
+
+        // 用户重新登录：探测 whoami 成功 → 恢复检查，不发「已恢复」
+        p.on_msg(&IpcMsg { kind: "nav".into(), login: Some(false), ..Default::default() }, &page, t, 0);
+        let t = t + Duration::from_secs(5);
+        p.tick(&page, t, 0);
+        let (req, call) = page.last();
+        assert_eq!(call, Call::Whoami);
+        p.on_msg(&reply(&req, "whoami", WHO), &page, t, 0);
+        assert_eq!(p.status.login, Login::In);
+        assert!(alerts.lock().unwrap().is_empty(), "重新登录不发「已恢复」");
+
+        // 之后真掉线：照常提醒
+        p.on_msg(&login_nav(), &page, t, 0);
+        let titles: Vec<String> = alerts.lock().unwrap().iter().map(|a| a.title.clone()).collect();
+        assert_eq!(titles, ["差评监控：需要重新登录"]);
+    }
+
+    #[test]
+    fn logout_while_running_drops_pending_reply() {
+        let mut h = H::new();
+        h.adv(7);
+        let (req, call) = h.page.last();
+        assert_eq!(call, Call::Whoami);
+        h.p.logout(h.t, 0);
+        // 退出前发出的请求晚到了：不应把状态改回已登录
+        h.p.on_msg(&reply(&req, "whoami", WHO), &h.page, h.t, 0);
+        assert_eq!(h.p.status.login, Login::Out);
     }
 
     #[test]

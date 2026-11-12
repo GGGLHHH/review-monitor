@@ -6,7 +6,7 @@ use std::path::Path;
 use std::rc::Rc;
 use wry::{dpi, NewWindowResponse, Rect, WebContext, WebView, WebViewBuilder};
 
-pub const START_URL: &str = "https://ecom.meituan.com/meishi/?cate=6103#https://ecom.meituan.com/emis/evaluation/poi";
+pub use rm_core::poller::START_URL;
 const POLLER_JS: &str = include_str!("../../../web/poller.js");
 
 /// 与 ui/app.slint 里 Layout.sidebar-w / topbar-h 一致（逻辑像素）
@@ -96,27 +96,13 @@ impl Host {
 
     /// 在评价页里定位一条评价（结果以 kind=reveal 的消息回传）
     pub fn reveal(&self, platform: rm_core::Platform, feedback_id: i64) {
-        let js = format!(
-            "if(window.__rm&&window.__rm.reveal){{window.__rm.reveal('{}','{feedback_id}')}}\
-             else{{window.ipc.postMessage(JSON.stringify({{kind:'reveal',error:'no_rm',href:location.href}}))}}",
-            platform.js_name()
-        );
-        let _ = self.wv.evaluate_script(&js);
+        let _ = self.wv.evaluate_script(&rm_core::poller::reveal_js(platform, feedback_id));
     }
 }
 
 impl Page for Host {
     fn call(&self, req_id: &str, call: &Call) {
-        let req = serde_json::to_string(req_id).unwrap_or_default();
-        let inner = match call {
-            Call::Whoami => format!("window.__rm.whoami({req})"),
-            Call::Pois => format!("window.__rm.poiList({req})"),
-            Call::List { platform, body } => format!("window.__rm.fetchList({req},{},{body})", serde_json::to_string(platform.js_name()).unwrap_or_default()),
-        };
-        // __rm 不在（页面还没载入完）：按「不在评价页」回报，由 poller 稍后重试
-        let js = format!(
-            "if(window.__rm){{{inner}}}else{{try{{window.ipc.postMessage(JSON.stringify({{reqId:{req},kind:'none',error:'no_iframe',href:location.href}}))}}catch(e){{}}}}"
-        );
+        let js = call.to_js(req_id);
         tracing::debug!("call {req_id} {call:?}");
         if let Err(e) = self.wv.evaluate_script(&js) {
             tracing::warn!("evaluate_script 失败: {e}");

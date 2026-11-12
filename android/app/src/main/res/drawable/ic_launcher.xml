@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 和电脑版一致：黄色圆角方块 + 右上角红点（文字「评」用矢量画不方便，先用对话气泡表示） -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:fillColor="#FFC300" android:pathData="M30,22h48a14,14 0,0 1,14 14v36a14,14 0,0 1,-14 14h-48a14,14 0,0 1,-14 -14v-36a14,14 0,0 1,14 -14z" />
+    <path android:fillColor="#1D1A10" android:pathData="M36,40h36a4,4 0,0 1,4 4v18a4,4 0,0 1,-4 4h-20l-10,8v-8h-6a4,4 0,0 1,-4 -4v-18a4,4 0,0 1,4 -4z" />
+    <path android:fillColor="#FFC300" android:pathData="M42,49h24v4h-24z M42,56h16v4h-16z" />
+    <path android:fillColor="#FF5F57" android:pathData="M84,26m-9,0a9,9 0,1 1,18 0a9,9 0,1 1,-18 0" />
+</vector>
