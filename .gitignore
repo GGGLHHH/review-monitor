@@ -1,0 +1,8 @@
+# 本地账号凭证，绝不提交
+docs/子账号.md
+*.secret
+.env
+target/
+
+# 编译产物（exe 从源码构建，不进库；dist/说明.md 保留）
+dist/*.exe

@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/app"]
+exclude = ["spike"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.42", features = ["bundled"] }
+rand = "0.9"
+tracing = "0.1"
+tempfile = "3"

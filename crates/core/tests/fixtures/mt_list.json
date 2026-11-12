@@ -1,0 +1,5 @@
+{"data":{"foldText":null,"data":{"total":7,"hasMore":true,"feedbacks":[
+{"addTime":1794046184634,"score":1,"accurateScore":1.0,"feedbackId":10566010284,"platform":0,"content":"","pictures":[],"videos":[],"replyCount":0,"replyList":[],"merchantReplyList":[],"sourceDesc":"消费后评价","poiId":10000001,"poiName":"测试门店（示例店）","userName":"用户A","anonymous":false,"subScoreList":[{"score":"1.0","notCountStar":false,"name":"口味"}]},
+{"addTime":1793967934207,"score":1,"accurateScore":0.5,"feedbackId":10561587928,"platform":0,"content":"非常难吃，虾明显是死的","pictures":[],"videos":[],"replyCount":0,"replyList":[],"merchantReplyList":[],"sourceDesc":"消费后评价","poiId":10000001,"poiName":"测试门店（示例店）","userName":"用户B","anonymous":false},
+{"addTime":1793591952000,"score":3,"accurateScore":3.0,"feedbackId":10525870294,"platform":0,"content":"红烧肉有点腥","pictures":[],"videos":[],"replyCount":1,"replyList":[],"merchantReplyList":[{"content":"感谢"}],"sourceDesc":"","poiId":10000001,"poiName":"测试门店（示例店）","userName":"匿名用户","anonymous":true}
+]}}}

@@ -1,0 +1,97 @@
+import { Theme, Card, Stepper, Toggle, PillButton } from "widgets.slint";
+import { ScrollView } from "std-widgets.slint";
+
+component Row inherits Rectangle {
+    in property <string> label;
+    in property <string> hint;
+    min-height: 58px;
+    HorizontalLayout {
+        padding-left: 18px; padding-right: 18px; spacing: 16px;
+        VerticalLayout {
+            horizontal-stretch: 1; alignment: center; spacing: 3px;
+            Text { text: root.label; color: Theme.text; font-size: 14px; }
+            if root.hint != "": Text { text: root.hint; color: Theme.faint; font-size: 12px; wrap: word-wrap; }
+        }
+        HorizontalLayout { alignment: end; VerticalLayout { alignment: center; @children } }
+    }
+}
+
+component Section inherits VerticalLayout {
+    in property <string> title;
+    spacing: 8px;
+    Text { text: root.title; color: Theme.sub; font-size: 12px; font-weight: 700; letter-spacing: 1px; }
+    Card { VerticalLayout { padding-top: 4px; padding-bottom: 4px; @children } }
+}
+
+export component SettingsPage inherits Rectangle {
+    in-out property <float> interval: 10;
+    in-out property <float> jitter: 20;
+    in-out property <float> overlap: 120;
+    in-out property <float> lookback: 48;
+    in-out property <float> max-pages: 5;
+    in-out property <float> mt-star: 3.5;
+    in-out property <float> dp-star: 3.5;
+    in-out property <bool> mt-on: true;
+    in-out property <bool> dp-on: true;
+    in-out property <bool> only-unreplied: false;
+    in-out property <bool> alert-existing: false;
+    in-out property <bool> toast-on: true;
+    in property <string> message;
+    in property <bool> message-ok: true;
+    callback save();
+    callback reset();
+
+    ScrollView {
+        VerticalLayout {
+            padding: 28px; spacing: 22px;
+            HorizontalLayout {
+                spacing: 12px;
+                VerticalLayout {
+                    horizontal-stretch: 1; spacing: 4px;
+                    Text { text: "设置"; color: Theme.text; font-size: 22px; font-weight: 700; }
+                    Text { text: "保存后从下一轮检查开始生效"; color: Theme.faint; font-size: 12px; }
+                }
+                PillButton { text: "恢复默认"; clicked => { root.reset(); } }
+                PillButton { text: "保存"; primary: true; clicked => { root.save(); } }
+            }
+            if root.message != "": Rectangle {
+                border-radius: 8px; height: msg.preferred-height + 18px;
+                background: (root.message-ok ? Theme.good : Theme.bad).with-alpha(0.14);
+                msg := Text { x: 14px; width: parent.width - 28px; text: root.message; wrap: word-wrap; font-size: 13px;
+                              color: root.message-ok ? Theme.good : Theme.bad; vertical-alignment: center; }
+            }
+
+            Section {
+                title: "差评判定";
+                Row { label: "美团差评阈值"; hint: "评分 ≤ 该值即算差评（美团默认「中差评」为 ≤3.5）";
+                      Stepper { value <=> root.mt-star; min: 0.5; max: 5; step: 0.5; decimals: 1; unit: "星"; } }
+                Row { label: "点评差评阈值"; hint: "点评的「中评」为 2.5–3.5，「差评」为 ≤2";
+                      Stepper { value <=> root.dp-star; min: 0.5; max: 5; step: 0.5; decimals: 1; unit: "星"; } }
+                Row { label: "监控美团评价"; Toggle { checked <=> root.mt-on; } }
+                Row { label: "监控点评评价"; Toggle { checked <=> root.dp-on; } }
+                Row { label: "只提醒未回复的"; hint: "已经回复过的差评不再提醒"; Toggle { checked <=> root.only-unreplied; } }
+            }
+
+            Section {
+                title: "检查频率";
+                Row { label: "检查间隔"; hint: "每隔多久去后台看一次";
+                      Stepper { value <=> root.interval; min: 1; max: 120; step: 1; unit: "分钟"; } }
+                Row { label: "随机抖动"; hint: "在间隔上下随机浮动，避免请求过于规律";
+                      Stepper { value <=> root.jitter; min: 0; max: 50; step: 5; unit: "%"; } }
+                Row { label: "重叠回看"; hint: "每轮从上次成功时间再往前多查一段，防止漏掉晚入库的评价";
+                      Stepper { value <=> root.overlap; min: 0; max: 1440; step: 30; unit: "分钟"; } }
+                Row { label: "首次回看"; hint: "第一次运行时查最近多久的评价";
+                      Stepper { value <=> root.lookback; min: 1; max: 720; step: 12; unit: "小时"; } }
+                Row { label: "每平台最多翻页"; hint: "每页 20 条";
+                      Stepper { value <=> root.max-pages; min: 1; max: 50; step: 1; unit: "页"; } }
+                Row { label: "首次运行也提醒已有差评"; hint: "关闭时，第一次查到的旧差评只入列表、不弹通知";
+                      Toggle { checked <=> root.alert-existing; } }
+            }
+
+            Section {
+                title: "推送渠道";
+                Row { label: "Windows 系统通知"; hint: "以后可扩展：手机通知、短信、企业微信…"; Toggle { checked <=> root.toast-on; } }
+            }
+        }
+    }
+}

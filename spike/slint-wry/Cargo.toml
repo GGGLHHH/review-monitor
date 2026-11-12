@@ -1,0 +1,12 @@
+[package]
+name = "spike-slint-wry"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+slint = { version = "1.18", features = ["raw-window-handle-06"] }
+wry = "0.57"
+raw-window-handle = "0.6"

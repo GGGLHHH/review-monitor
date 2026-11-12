@@ -1,0 +1,210 @@
+import { Theme, PillButton, NavItem, Toggle, Card, Tag, MiniButton } from "widgets.slint";
+import { SettingsPage } from "settings.slint";
+import { ListView } from "std-widgets.slint";
+
+export struct ReviewRow {
+    key: string,
+    platform: string,   // "美团" / "点评"
+    is-mt: bool,
+    star: string,       // "2.5★"
+    star-value: float,
+    time: string,
+    content: string,
+    source: string,
+    replied: bool,
+    bad: bool,
+    read: bool,
+}
+
+// 与 main.rs 中 SIDEBAR_W / TOPBAR_H 保持一致：后台页 WebView 就叠放在这块内容区上
+export global Layout {
+    out property <length> sidebar-w: 208px;
+    out property <length> topbar-h: 64px;
+}
+
+component ReviewCard inherits Rectangle {
+    in property <ReviewRow> item;
+    callback open();
+    callback read();
+    height: body.preferred-height + 30px;
+    border-radius: Theme.radius;
+    background: ta.has-hover ? Theme.card-hover : Theme.card;
+    border-width: 1px;
+    border-color: root.item.bad && !root.item.read ? Theme.bad.with-alpha(0.55) : Theme.border;
+    animate background { duration: 100ms; }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { root.open(); } }
+    body := VerticalLayout {
+        x: 16px; y: 15px; width: parent.width - 32px; spacing: 8px;
+        HorizontalLayout {
+            spacing: 8px;
+            if !root.item.read && root.item.bad: Rectangle { width: 8px; height: 8px; y: 6px; border-radius: 4px; background: Theme.bad; }
+            Tag { text: root.item.platform; tint: root.item.is-mt ? Theme.mt : Theme.dp; }
+            Text { text: root.item.star; color: root.item.bad ? Theme.bad : Theme.good; font-size: 14px; font-weight: 800; vertical-alignment: center; }
+            Text { text: root.item.time; color: Theme.sub; font-size: 12px; vertical-alignment: center; }
+            if root.item.source != "": Text { text: "· " + root.item.source; color: Theme.faint; font-size: 12px; vertical-alignment: center; }
+            Rectangle { horizontal-stretch: 1; }
+            if root.item.bad: Tag { text: root.item.read ? "已读" : "未读"; tint: root.item.read ? Theme.faint : Theme.bad; }
+            Tag { text: root.item.replied ? "已回复" : "未回复"; tint: root.item.replied ? Theme.good : Theme.warn; }
+            if root.item.bad: VerticalLayout { alignment: center;
+                MiniButton { text: root.item.read ? "标为未读" : "标为已读"; clicked => { root.read(); } } }
+        }
+        Text {
+            text: root.item.content == "" ? "（无文字）" : root.item.content;
+            color: root.item.content == "" ? Theme.faint : root.item.bad && root.item.read ? Theme.sub : Theme.text;
+            font-size: 14px; wrap: word-wrap;
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "差评监控";
+    icon: @image-url("../assets/icon.png");
+    preferred-width: 1200px;
+    preferred-height: 800px;
+    min-width: 980px;
+    min-height: 640px;
+    background: Theme.bg;
+    default-font-family: Theme.font;
+
+    // ---- 状态（Rust 写入）----
+    in property <[ReviewRow]> rows;
+    in property <int> logged-in: 0;        // 0 未知 1 已登录 2 未登录
+    in property <string> status-text: "启动中…";
+    in property <string> next-text;
+    in property <bool> busy;
+    in property <int> unread;
+    in property <string> banner;           // 顶部提示（配置回退、推送失败等）
+    in property <string> list-summary;
+    in property <string> backend-hint;     // 后台页标题下的提示（定位评价的结果）
+    in-out property <int> tab: 0;          // 0 差评 1 后台 2 设置
+    in-out property <bool> only-bad: true;
+
+    // ---- 设置页（Rust 读写）----
+    in-out property <float> s-interval <=> settings.interval;
+    in-out property <float> s-jitter <=> settings.jitter;
+    in-out property <float> s-overlap <=> settings.overlap;
+    in-out property <float> s-lookback <=> settings.lookback;
+    in-out property <float> s-max-pages <=> settings.max-pages;
+    in-out property <float> s-mt-star <=> settings.mt-star;
+    in-out property <float> s-dp-star <=> settings.dp-star;
+    in-out property <bool> s-mt-on <=> settings.mt-on;
+    in-out property <bool> s-dp-on <=> settings.dp-on;
+    in-out property <bool> s-only-unreplied <=> settings.only-unreplied;
+    in-out property <bool> s-alert-existing <=> settings.alert-existing;
+    in-out property <bool> s-toast-on <=> settings.toast-on;
+    in property <string> settings-msg <=> settings.message;
+    in property <bool> settings-ok <=> settings.message-ok;
+
+    callback check-now();
+    callback open-review(string);
+    callback toggle-read(string, bool);   // (key, 改成的状态)
+    callback mark-all-read();
+    callback tab-changed(int);
+    callback filter-changed(bool);
+    callback save-settings();
+    callback reset-settings();
+    callback reload-backend();
+
+    HorizontalLayout {
+        // ---------- 侧栏 ----------
+        Rectangle {
+            width: Layout.sidebar-w;
+            background: Theme.panel;
+            VerticalLayout {
+                padding: 14px; padding-top: 18px; spacing: 6px;
+                HorizontalLayout {
+                    padding-left: 8px; padding-bottom: 18px; spacing: 10px;
+                    Rectangle { width: 30px; height: 30px; border-radius: 8px; background: Theme.accent;
+                        Text { text: "评"; color: Theme.accent-ink; font-size: 17px; font-weight: 900; horizontal-alignment: center; vertical-alignment: center; } }
+                    VerticalLayout { alignment: center;
+                        Text { text: "差评监控"; color: Theme.text; font-size: 16px; font-weight: 800; }
+                        Text { text: "美团 · 大众点评"; color: Theme.faint; font-size: 11px; } }
+                }
+                NavItem { text: "差评列表"; icon: "●"; active: root.tab == 0; badge: root.unread;
+                          clicked => { root.tab = 0; root.tab-changed(0); } }
+                NavItem { text: "后台页面"; icon: "◆"; active: root.tab == 1;
+                          clicked => { root.tab = 1; root.tab-changed(1); } }
+                NavItem { text: "设置"; icon: "⚙"; active: root.tab == 2;
+                          clicked => { root.tab = 2; root.tab-changed(2); } }
+                Rectangle { vertical-stretch: 1; }
+                Card {
+                    height: 104px;
+                    VerticalLayout {
+                        padding: 12px; spacing: 6px;
+                        HorizontalLayout { spacing: 8px;
+                            Rectangle { width: 9px; height: 9px; y: 5px; border-radius: 5px;
+                                background: root.logged-in == 1 ? Theme.good : root.logged-in == 2 ? Theme.bad : Theme.faint; }
+                            Text { text: root.logged-in == 1 ? "后台已登录" : root.logged-in == 2 ? "需要登录" : "检测中";
+                                   color: Theme.text; font-size: 13px; font-weight: 700; } }
+                        Text { text: root.status-text; color: Theme.sub; font-size: 11px; wrap: word-wrap; }
+                        Text { text: root.next-text; color: Theme.faint; font-size: 11px; wrap: word-wrap; }
+                    }
+                }
+            }
+        }
+
+        // ---------- 主区 ----------
+        VerticalLayout {
+            Rectangle {
+                height: Layout.topbar-h;
+                background: Theme.bg;
+                HorizontalLayout {
+                    padding-left: 26px; padding-right: 20px; spacing: 10px;
+                    VerticalLayout { alignment: center; horizontal-stretch: 1;
+                        Text { text: root.tab == 0 ? "差评列表" : root.tab == 1 ? "后台页面" : "设置";
+                               color: Theme.text; font-size: 18px; font-weight: 800; }
+                        if root.tab == 1: Text { text: root.backend-hint != "" ? root.backend-hint : "在这里登录（滑块请手动拖）；点差评卡片或通知会跳到对应的评价"; color: root.backend-hint != "" ? Theme.warn : Theme.faint; font-size: 11px; }
+                    }
+                    if root.tab == 1: VerticalLayout { alignment: center; PillButton { text: "回到评价页"; clicked => { root.reload-backend(); } } }
+                    VerticalLayout { alignment: center;
+                        PillButton { text: root.busy ? "检查中…" : "立即检查"; primary: true; enabled: !root.busy; clicked => { root.check-now(); } } }
+                }
+                Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+            }
+
+            if root.banner != "" && root.tab != 1: Rectangle {
+                height: bt.preferred-height + 16px;
+                background: Theme.warn.with-alpha(0.13);
+                bt := Text { x: 26px; width: parent.width - 52px; text: root.banner; color: Theme.warn; font-size: 12px; wrap: word-wrap; vertical-alignment: center; }
+            }
+
+            // 内容区
+            Rectangle {
+                vertical-stretch: 1;
+                if root.tab == 0: VerticalLayout {
+                    padding-left: 26px; padding-right: 26px; padding-top: 16px; spacing: 12px;
+                    HorizontalLayout {
+                        spacing: 10px;
+                        Text { text: root.list-summary; color: Theme.sub; font-size: 13px; vertical-alignment: center; horizontal-stretch: 1; }
+                        Text { text: "只看差评"; color: Theme.sub; font-size: 13px; vertical-alignment: center; }
+                        VerticalLayout { alignment: center;
+                            Toggle { checked <=> root.only-bad; toggled(v) => { root.filter-changed(v); } } }
+                        PillButton { text: "全部标为已读"; enabled: root.unread > 0; clicked => { root.mark-all-read(); } }
+                    }
+                    if root.rows.length == 0: Rectangle {
+                        vertical-stretch: 1;
+                        VerticalLayout { alignment: center; spacing: 6px;
+                            Text { text: "暂无差评"; color: Theme.sub; font-size: 16px; horizontal-alignment: center; }
+                            Text { text: "有新差评时会在这里出现，并弹出系统通知"; color: Theme.faint; font-size: 12px; horizontal-alignment: center; } }
+                    }
+                    if root.rows.length > 0: ListView {
+                        vertical-stretch: 1;
+                        for r in root.rows: VerticalLayout {
+                            padding-bottom: 10px;
+                            ReviewCard { item: r; open => { root.open-review(r.key); } read => { root.toggle-read(r.key, !r.read); } }
+                        }
+                    }
+                }
+                // tab == 1：WebView（原生子窗口）叠放在这里
+                if root.tab == 1: Rectangle {
+                    Text { text: "正在载入后台页面…"; color: Theme.faint; horizontal-alignment: center; vertical-alignment: center; }
+                }
+                settings := SettingsPage {
+                    visible: root.tab == 2;
+                    save => { root.save-settings(); }
+                    reset => { root.reset-settings(); }
+                }
+            }
+        }
+    }
+}

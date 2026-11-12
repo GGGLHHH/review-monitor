@@ -1,0 +1,148 @@
+// 自定义主题与基础控件（不用 Slint 默认样式）
+export global Theme {
+    out property <color> bg: #14161b;
+    out property <color> panel: #1b1e25;
+    out property <color> card: #22262f;
+    out property <color> card-hover: #282d38;
+    out property <color> border: #2f3441;
+    out property <color> text: #eceef3;
+    out property <color> sub: #9aa1b0;
+    out property <color> faint: #6b7282;
+    out property <color> accent: #ffc300;
+    out property <color> accent-ink: #1d1a10;
+    out property <color> bad: #ff5f57;
+    out property <color> warn: #ffa53d;
+    out property <color> good: #39c98a;
+    out property <color> mt: #ffc300;
+    out property <color> dp: #ff7a45;
+    out property <length> radius: 10px;
+    out property <string> font: "Microsoft YaHei UI";
+}
+
+export component PillButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary: false;
+    in property <bool> enabled: true;
+    callback clicked();
+    height: 34px;
+    min-width: label.preferred-width + 28px;
+    border-radius: 17px;
+    background: !enabled ? Theme.card : primary ? (ta.pressed ? Theme.accent.darker(15%) : ta.has-hover ? Theme.accent.brighter(8%) : Theme.accent)
+                        : (ta.pressed ? Theme.border : ta.has-hover ? Theme.card-hover : Theme.card);
+    border-width: primary ? 0 : 1px;
+    border-color: Theme.border;
+    animate background { duration: 120ms; }
+    label := Text {
+        text: root.text;
+        color: !root.enabled ? Theme.faint : root.primary ? Theme.accent-ink : Theme.text;
+        font-size: 13px;
+        font-weight: root.primary ? 700 : 500;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// 卡片里用的小按钮（自带 TouchArea，点它不会触发外面卡片的点击）
+export component MiniButton inherits Rectangle {
+    in property <string> text;
+    callback clicked();
+    height: 24px;
+    width: mt.preferred-width + 18px;
+    border-radius: 12px;
+    background: mta.pressed ? Theme.border : mta.has-hover ? Theme.card-hover.brighter(10%) : transparent;
+    border-width: 1px;
+    border-color: mta.has-hover ? Theme.sub : Theme.border;
+    animate background { duration: 100ms; }
+    mt := Text { text: root.text; color: mta.has-hover ? Theme.text : Theme.sub; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+    mta := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+export component NavItem inherits Rectangle {
+    in property <string> text;
+    in property <string> icon;
+    in property <bool> active;
+    in property <int> badge: 0;
+    callback clicked();
+    height: 42px;
+    border-radius: 9px;
+    background: active ? Theme.accent.with-alpha(0.14) : ta.has-hover ? Theme.card : transparent;
+    animate background { duration: 120ms; }
+    HorizontalLayout {
+        padding-left: 14px; padding-right: 10px; spacing: 10px;
+        Text { text: root.icon; font-size: 16px; vertical-alignment: center; color: root.active ? Theme.accent : Theme.sub; }
+        Text { text: root.text; font-size: 14px; vertical-alignment: center; color: root.active ? Theme.text : Theme.sub; font-weight: root.active ? 700 : 400; horizontal-stretch: 1; }
+        if root.badge > 0: Rectangle {
+            y: (parent.height - 20px) / 2; height: 20px; width: max(20px, bt.preferred-width + 10px);
+            border-radius: 10px; background: Theme.bad;
+            bt := Text { text: root.badge > 99 ? "99+" : root.badge; color: white; font-size: 11px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+        }
+    }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+export component Toggle inherits Rectangle {
+    in-out property <bool> checked;
+    callback toggled(bool);
+    width: 44px; height: 24px; border-radius: 12px;
+    background: checked ? Theme.accent : Theme.border;
+    animate background { duration: 150ms; }
+    knob := Rectangle {
+        width: 18px; height: 18px; border-radius: 9px; y: 3px;
+        x: root.checked ? root.width - self.width - 3px : 3px;
+        background: root.checked ? Theme.accent-ink : Theme.sub;
+        animate x { duration: 150ms; easing: ease-out; }
+    }
+    TouchArea { mouse-cursor: pointer; clicked => { root.checked = !root.checked; root.toggled(root.checked); } }
+}
+
+component StepBtn inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled;
+    callback clicked();
+    width: 30px; border-radius: 7px;
+    background: ta.pressed && enabled ? Theme.border : ta.has-hover && enabled ? Theme.card-hover : transparent;
+    Text { text: root.text; color: root.enabled ? Theme.text : Theme.faint; font-size: 16px; horizontal-alignment: center; vertical-alignment: center; }
+    ta := TouchArea { enabled: root.enabled; mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+// 数值步进器：− 值 +，自动夹在 [min, max]
+export component Stepper inherits Rectangle {
+    in-out property <float> value;
+    in property <float> min: 0;
+    in property <float> max: 100;
+    in property <float> step: 1;
+    in property <int> decimals: 0;
+    in property <string> unit;
+    width: 176px; height: 34px; border-radius: 8px;
+    background: Theme.card; border-width: 1px; border-color: Theme.border;
+    HorizontalLayout {
+        padding: 2px;
+        StepBtn { text: "−"; enabled: root.value > root.min; clicked => { root.value = Math.max(root.min, root.value - root.step); } }
+        Text {
+            horizontal-stretch: 1;
+            text: (root.decimals == 0 ? root.value.round() : root.value.to-fixed(root.decimals)) + " " + root.unit;
+            color: Theme.text; font-size: 13px; horizontal-alignment: center; vertical-alignment: center;
+        }
+        StepBtn { text: "+"; enabled: root.value < root.max; clicked => { root.value = Math.min(root.max, root.value + root.step); } }
+    }
+}
+
+export component Card inherits Rectangle {
+    background: Theme.card;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.border;
+}
+
+export component Tag inherits Rectangle {
+    in property <string> text;
+    in property <color> tint: Theme.sub;
+    height: 20px; width: t.preferred-width + 14px; border-radius: 5px;
+    background: root.tint.with-alpha(0.16);
+    t := Text { text: root.text; color: root.tint; font-size: 11px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+}
