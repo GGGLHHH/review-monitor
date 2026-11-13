@@ -2,7 +2,7 @@
 
 监控自家门店在美团、大众点评上的新差评，有新差评就弹 Windows 通知。只读，不会替你回复。
 
-数据来源是美团经营宝网页版（`ecom.meituan.com`）的评价页：程序里嵌了一个浏览器，你在里面登录一次，之后程序在页面里按间隔调用评价列表接口。
+数据来源是美团经营宝网页版（`ecom.meituan.com`）的评价页：程序里嵌了一个浏览器，你在里面登录一次，之后程序直接在后台按间隔调用评价列表接口（复用内嵌浏览器的登录 cookie；实测这几个接口不需要页面里的签名参数）。
 
 只监控你自己的门店、用你自己的账号；纯本地运行，没有服务器，数据不上传。Windows 版和安卓版各自独立（各自登录、各自检查、各自提醒）。
 
@@ -98,7 +98,9 @@ crates/core/   业务逻辑（纯 Rust，有单元测试）
   poller.rs    轮询状态机（通过 Page trait 和页面交互，可脱离界面测试）
   notify/      推送抽象层和 Windows 通知
 crates/app/    Slint 界面 + wry 内嵌 WebView + 托盘
-web/poller.js  注入页面的脚本，只负责代发请求、回传原始 JSON
+  direct.rs    直连评价接口（cookie 从 WebView2 的 cookie 库取，免页面签名）
+  webview.rs   WebView 只管登录界面和定位评价
+web/poller.js  注入页面的脚本：安卓用；Windows 上只负责上报页面导航和定位评价
 ```
 
 测试：`cargo test --workspace`。

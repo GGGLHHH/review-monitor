@@ -5,7 +5,7 @@ exclude = ["spike"]
 
 [workspace.package]
 edition = "2024"
-version = "0.1.0"
+version = "0.1.1"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -18,3 +18,4 @@ rusqlite = { version = "0.42", features = ["bundled"] }
 rand = "0.9"
 tracing = "0.1"
 tempfile = "3"
+ureq = "3"

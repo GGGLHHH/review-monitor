@@ -12,8 +12,8 @@ android {
         applicationId = "com.reviewmonitor"
         minSdk = 28
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.1.1"
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }
 
@@ -32,12 +32,13 @@ android {
     sourceSets["main"].jniLibs.directories.add("src/main/jniLibs")
 }
 
-// 注入页面的脚本和电脑版共用一份：构建时从仓库根的 web/poller.js 复制
-val copyPollerJs by tasks.registering(Copy::class) {
-    from(rootProject.file("../web/poller.js"), rootProject.file("../web/login.js"))
+// 登录辅助脚本（只注入美团登录表单所在的帧）：构建时从仓库根的 web/login.js 复制。
+// 取数不再经过网页，以前的 poller.js 已经删掉。
+val copyLoginJs by tasks.registering(Copy::class) {
+    from(rootProject.file("../web/login.js"))
     into(layout.projectDirectory.dir("src/main/assets"))
 }
-tasks.named("preBuild") { dependsOn(copyPollerJs) }
+tasks.named("preBuild") { dependsOn(copyLoginJs) }
 
 dependencies {
     val composeBom = platform("androidx.compose:compose-bom:2026.09.00")

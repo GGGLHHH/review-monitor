@@ -8,7 +8,6 @@ import android.os.Looper
 import android.util.Log
 import android.view.ViewGroup
 import android.webkit.CookieManager
-import android.webkit.JavascriptInterface
 import android.webkit.WebSettings
 import android.webkit.WebStorage
 import android.webkit.WebView
@@ -27,32 +26,64 @@ data class LoginForm(
 )
 
 /**
- * 后台页面：一个常驻的 WebView，由前台服务持有。
- * 平时不显示，只用来在登录态下请求接口；掉线需要登录时才挂到界面上让用户登录，登录完摘下来，页面一直活着。
- * 和电脑版共用同一份 web/poller.js：脚本通过 window.ipc.postMessage(String) 回传，这里用 addJavascriptInterface 提供同名接口。
+ * 登录用的 WebView：**只在需要登录时才创建**，由前台服务持有。
+ * 用户在这里（或应用自己的登录页，经 login.js 代填）登录美团经营宝；一旦进到经营宝后台的页面，
+ * 就把 cookie（含 httpOnly 的 bsid）和 UA 交给 [onCredentials]，由 Rust 直接带着它请求接口。
+ * 登录确认成功后服务会把这个 WebView 销毁；平时取数完全不经过网页。
  */
 @SuppressLint("SetJavaScriptEnabled")
-class WebHost(app: Context, private val startUrl: String, private val onMessage: (String) -> Unit) {
+class WebHost(app: Context, private val startUrl: String, private val onCredentials: (cookie: String, userAgent: String) -> Unit) {
     companion object {
         private const val TAG = "RM.Web"
-        // 不在界面上时，按桌面窗口大小排版，后台页的 iframe 才会正常加载
+        // 不在界面上时，按桌面窗口大小排版，登录表单才会正常渲染（应用自己的登录页靠 login.js 在后台代填）
         private const val OFF_W = 1280
         private const val OFF_H = 900
         private val LOGIN_ORIGIN = setOf("https://epassport.meituan.com")
+        const val SITE = "https://ecom.meituan.com/"
+
+        /** 经营宝网页版是桌面站：用桌面 Chrome 的 UA，版本号沿用本机 WebView 的。直连请求也用同一个 UA */
+        fun desktopUa(ctx: Context): String {
+            val chrome = Regex("Chrome/[\\d.]+").find(WebSettings.getDefaultUserAgent(ctx))?.value ?: "Chrome/140.0.0.0"
+            return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) $chrome Safari/537.36"
+        }
+
+        /** WebView 的 cookie 库里经营宝的 cookie（不需要开着 WebView）。没有返回空串 */
+        fun storedCookies(): String = runCatching { CookieManager.getInstance().getCookie(SITE) }.getOrNull().orEmpty()
+
+        /**
+         * cookie 里有没有经营宝的会话凭据（httpOnly 的 kdb-bsid，2026-11-13 实测单独带它就能通过鉴权）。
+         * 登录前跳转经过经营宝页面时也会种几个 cookie（埋点之类），那些交过去只会白白触发探测
+         */
+        fun hasSession(cookie: String): Boolean = cookie.contains("com.sankuai.meishi.fe.kdb-bsid=")
+
+        /** 是不是已经进到经营宝后台（不是登录页）。只有这时取到的 cookie 才可能是登录态 */
+        fun isBackendPage(url: String?): Boolean {
+            val u = url ?: return false
+            return u.startsWith(SITE) && !u.contains("/bizaccount/login") && !u.contains("login.html")
+        }
+
+        /** 退出登录：清掉这台手机上的登录状态（cookie、页面存储）。不调用美团的退出接口，不影响电脑上的登录 */
+        fun clearLoginData(done: () -> Unit) {
+            val cm = CookieManager.getInstance()
+            cm.removeAllCookies {
+                cm.flush()
+                WebStorage.getInstance().deleteAllData()
+                Log.i(TAG, "已清除登录状态")
+                done()
+            }
+        }
     }
 
     private val appCtx = app.applicationContext
     private val ctx = MutableContextWrapper(appCtx)
     private val main = Handler(Looper.getMainLooper())
-    private val pollerJs: String = appCtx.assets.open("poller.js").bufferedReader().use { it.readText() }
     private val loginJs: String = appCtx.assets.open("login.js").bufferedReader().use { it.readText() }
+    private val ua = desktopUa(appCtx)
+    private var destroyed = false
 
     /** 应用自己的登录页靠它知道：能不能代填、要不要把滑块露出来 */
     val loginForm = MutableStateFlow(LoginForm())
     private var loginProxy: JavaScriptReplyProxy? = null
-
-    /** 界面是否正显示着后台页（和电脑版 user_visible 同义：用户在看时不要自动刷新页面） */
-    @Volatile var userVisible = false
 
     val webView: WebView = WebView(ctx).apply {
         settings.apply {
@@ -64,37 +95,30 @@ class WebHost(app: Context, private val startUrl: String, private val onMessage:
             builtInZoomControls = true
             displayZoomControls = false
             mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
-            // 经营宝网页版是桌面站：用桌面 Chrome 的 UA，版本号沿用本机 WebView 的
-            val chrome = Regex("Chrome/[\\d.]+").find(WebSettings.getDefaultUserAgent(appCtx))?.value ?: "Chrome/140.0.0.0"
-            userAgentString = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) $chrome Safari/537.36"
+            userAgentString = ua
         }
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-        addJavascriptInterface(Bridge(), "ipc")
         webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
                 // 换页了：旧表单作废，等新页面里的 login.js 重新上报
                 loginProxy = null
                 loginForm.value = LoginForm()
-                if (!docStartSupported) view.evaluateJavascript(pollerJs, null)
             }
             override fun onPageFinished(view: WebView, url: String?) {
-                if (!docStartSupported) view.evaluateJavascript(pollerJs, null)
                 CookieManager.getInstance().flush()
+                harvest(url)
             }
+            // 单页应用里的地址变化（不触发 onPageFinished）也看一眼
+            override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) = harvest(url)
         }
     }
 
-    private val docStartSupported = WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)
-
     init {
-        if (docStartSupported) {
-            WebViewCompat.addDocumentStartJavaScript(webView, pollerJs, setOf("https://ecom.meituan.com"))
-        } else {
-            Log.w(TAG, "WebView 不支持 DOCUMENT_START_SCRIPT，改为页面加载时注入")
-        }
+        // 调试版允许用电脑上的开发者工具查看登录页面（正式版不开）
+        if (appCtx.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) WebView.setWebContentsDebuggingEnabled(true)
         // 登录表单在 epassport 的跨域帧里：只给这个来源注入 login.js，也只接受它发来的消息
-        if (docStartSupported && WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT) && WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
             WebViewCompat.addWebMessageListener(webView, "rmLogin", LOGIN_ORIGIN) { _, message, _, _, reply ->
                 val o = try { JSONObject(message.data ?: return@addWebMessageListener) } catch (_: Exception) { return@addWebMessageListener }
                 if (o.optString("t") == "state") {
@@ -109,6 +133,24 @@ class WebHost(app: Context, private val startUrl: String, private val onMessage:
         }
         layoutOffscreen()
         webView.loadUrl(startUrl)
+    }
+
+    private var lastHarvest = ""
+
+    /** 进到经营宝后台了：把 cookie 交出去（同一份不重复交） */
+    private fun harvest(url: String?) {
+        if (destroyed || !isBackendPage(url)) return
+        val c = storedCookies()
+        if (!hasSession(c) || c == lastHarvest) return
+        lastHarvest = c
+        Log.i(TAG, "已进入经营宝后台，交出登录 cookie")
+        onCredentials(c, ua)
+    }
+
+    /** 服务销毁 WebView 前再取一次（登录后页面可能又续发了 cookie） */
+    fun harvestNow() {
+        lastHarvest = ""
+        harvest(webView.url)
     }
 
     /** 把用户在应用登录页输入的账号密码填进美团的表单并提交（只在内存里经过，不保存）。表单不在时返回 false */
@@ -147,18 +189,13 @@ class WebHost(app: Context, private val startUrl: String, private val onMessage:
         webView.layout(0, 0, OFF_W, OFF_H)
     }
 
-    private inner class Bridge {
-        // 在 JavaBridge 线程上被调用，转到主线程处理
-        @JavascriptInterface
-        fun postMessage(s: String) { main.post { onMessage(s) } }
-    }
+    private fun eval(js: String) = main.post { if (!destroyed) webView.evaluateJavascript(js, null) }
 
-    fun eval(js: String) = main.post { webView.evaluateJavascript(js, null) }
-
-    fun goto(url: String) = main.post { webView.loadUrl(url) }
+    fun goto(url: String) = main.post { if (!destroyed) webView.loadUrl(url) }
 
     /** 挂到界面上（传 Activity 作为 Context，滑块等交互才正常） */
     fun attach(activity: Context, parent: ViewGroup) {
+        if (destroyed) return
         (webView.parent as? ViewGroup)?.removeView(webView)
         ctx.baseContext = activity
         parent.addView(webView, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
@@ -166,30 +203,21 @@ class WebHost(app: Context, private val startUrl: String, private val onMessage:
         webView.resumeTimers()
     }
 
-    /** 从界面上摘下来，页面和 JS 继续在服务里跑 */
+    /** 从界面上摘下来。页面继续在服务里跑（应用自己的登录页要靠它在后台代填） */
     fun detach() {
+        if (destroyed) return
         (webView.parent as? ViewGroup)?.removeView(webView)
         ctx.baseContext = appCtx
-        // 注意：不调用 onPause / pauseTimers，否则后台取数会停
         webView.resumeTimers()
         layoutOffscreen()
     }
 
-    /** 退出登录：清掉这台手机上的登录状态（cookie、页面存储、缓存），再打开起始页（会跳到登录页）。不调用美团的退出接口，不影响电脑上的登录 */
-    fun clearLogin() = main.post {
-        val cm = CookieManager.getInstance()
-        cm.removeAllCookies {
-            cm.flush()
-            WebStorage.getInstance().deleteAllData()
-            webView.clearCache(true)
-            webView.clearHistory()
-            webView.loadUrl(startUrl)
-            Log.i(TAG, "已清除登录状态")
-        }
-    }
-
     fun destroy() {
+        if (destroyed) return
+        destroyed = true
         (webView.parent as? ViewGroup)?.removeView(webView)
+        webView.stopLoading()
         webView.destroy()
+        Log.i(TAG, "登录 WebView 已销毁")
     }
 }

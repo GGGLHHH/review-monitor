@@ -32,16 +32,33 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.core.app.NotificationManagerCompat
 import com.reviewmonitor.ui.Actions
 import com.reviewmonitor.ui.AppScreen
+import com.reviewmonitor.core.parseLaunch
 import com.reviewmonitor.ui.C
+import com.reviewmonitor.ui.Focus
 import com.reviewmonitor.ui.KeepAlive
 import kotlinx.coroutines.flow.MutableStateFlow
 
 class MainActivity : ComponentActivity() {
     private var service by mutableStateOf<MonitorService?>(null)
     private var keep by mutableStateOf(KeepAlive(true, true, null, false))
-    private var manualLogin by mutableStateOf(false)
-    private var webShown = false
-    private var resumed = false
+    /** 点差评通知进来的：评价页要定位到这一条 */
+    private var focus by mutableStateOf<Focus?>(null)
+
+    /** 通知带的 review-monitor://open?review=dp:123 → 评价页定位那一条 */
+    private fun handleLaunch(i: Intent?) {
+        val uri = i?.data?.toString() ?: return
+        val l = parseLaunch(uri) ?: return
+        if (l.kind == "review" && l.reviewKey.isNotEmpty()) {
+            focus = Focus(l.reviewKey, System.nanoTime())
+            service?.engine?.setRead(l.reviewKey, true)
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleLaunch(intent)
+    }
 
     private val conn = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, b: IBinder?) {
@@ -59,6 +76,7 @@ class MainActivity : ComponentActivity() {
             askNotifyPerm.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
         MonitorService.start(this)
+        if (savedInstanceState == null) handleLaunch(intent)
         val empty = MutableStateFlow(UiState())
         setContent {
             val st by (service?.ui ?: empty).collectAsState()
@@ -74,10 +92,9 @@ class MainActivity : ComponentActivity() {
                         quit = ::quit,
                         logout = { service?.logout() },
                     ),
-                    manualLogin = manualLogin,
-                    setManualLogin = { manualLogin = it },
                     attachWeb = ::attachWeb,
                     detachWeb = ::detachWeb,
+                    focus = focus,
                 )
             }
         }
@@ -86,15 +103,11 @@ class MainActivity : ComponentActivity() {
     // ---------------- 登录页挂载 ----------------
 
     private fun attachWeb(parent: FrameLayout) {
-        val s = service ?: return
-        s.web.attach(this, parent)
-        webShown = true
-        s.web.userVisible = resumed
+        service?.web?.attach(this, parent)
     }
 
     private fun detachWeb() {
-        webShown = false
-        service?.web?.let { it.userVisible = false; it.detach() }
+        service?.web?.detach()
     }
 
     override fun onStart() {
@@ -104,15 +117,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        resumed = true
-        service?.web?.userVisible = webShown
         refreshKeep()
-    }
-
-    override fun onPause() {
-        resumed = false
-        service?.web?.userVisible = false
-        super.onPause()
     }
 
     override fun onStop() {

@@ -7,7 +7,9 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.key
 import androidx.compose.ui.platform.LocalContext
+import com.reviewmonitor.WebHost
 import kotlinx.coroutines.delay
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -61,25 +63,43 @@ class Actions(
     val logout: () -> Unit,
 )
 
-/** 只有一页：状态 → 保持后台运行 → 参数。需要登录时整页换成登录页 */
+/** 两页：评价（按网页版筛选直接查）、监控（状态 → 保持后台运行 → 参数）。需要登录时整页换成登录页 */
 @Composable
 fun AppScreen(
     svc: MonitorService?,
     st: UiState,
     keep: KeepAlive,
     actions: Actions,
-    manualLogin: Boolean,
-    setManualLogin: (Boolean) -> Unit,
     attachWeb: (FrameLayout) -> Unit,
     detachWeb: () -> Unit,
+    focus: Focus? = null,
 ) {
     val needLogin = st.status?.login == 2
+    val web = svc?.webFlow?.collectAsState()?.value
     Column(Modifier.fillMaxSize().background(C.bg)) {
         when {
-            svc == null -> MainPane(svc, st, keep, actions, onOpenBackend = {})
-            needLogin -> LoginPane(svc, attachWeb, detachWeb)
-            manualLogin -> WebPane("后台页面", "这是后台用来取数的页面，只在排查问题时才需要看。", "关闭", { setManualLogin(false) }, { svc.web.goto(startUrl()) }, attachWeb, detachWeb)
-            else -> MainPane(svc, st, keep, actions, onOpenBackend = { setManualLogin(true) })
+            svc == null -> MainPane(svc, st, keep, actions)
+            // 登录网页每次需要登录时新建一个：换了实例就整页重来，重新挂载
+            needLogin && web != null -> key(web) { LoginPane(svc, web, attachWeb, detachWeb) }
+            needLogin -> Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("正在打开登录页…", color = C.sub, fontSize = 14.sp)
+            }
+            else -> {
+                var tab by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(0) }
+                // 点差评通知进来：切到评价页
+                LaunchedEffect(focus) { if (focus != null) tab = 0 }
+                Row(Modifier.fillMaxWidth().background(C.panel).padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Seg(listOf("评价", "监控"), tab) { tab = it }
+                    Spacer(Modifier.weight(1f))
+                    val s = st.status
+                    Dot(if (s?.login == 1) C.good else C.faint, 8)
+                    Spacer(Modifier.width(6.dp))
+                    Text(if (s?.busy == true) "检查中" else if (s?.login == 1) "监控中" else "检测中", color = C.sub, fontSize = 12.sp)
+                }
+                Box(Modifier.weight(1f)) {
+                    if (tab == 0) ReviewsPane(svc.engine, focus) else MainPane(svc, st, keep, actions)
+                }
+            }
         }
     }
 }
@@ -88,12 +108,13 @@ fun AppScreen(
 
 /**
  * 应用自己的登录页：账号密码在这里输入，由 login.js 填进美团的表单并提交。
- * 美团的安全验证（滑块）出现时，把后台页面露出来让用户自己拖；验证不代做。
+ * 美团的安全验证（滑块）出现时，把登录网页露出来让用户自己拖；验证不代做。
  * 表单迟迟不出现（改版、要短信验证等）时，可以改用完整网页登录。
+ * 进到经营宝后台后网页把 cookie 交给 Engine，确认登录成功后服务会关掉网页，这一页也就消失了。
  */
 @Composable
-private fun LoginPane(svc: MonitorService, attach: (FrameLayout) -> Unit, detach: () -> Unit) {
-    val form by svc.web.loginForm.collectAsState()
+private fun LoginPane(svc: MonitorService, web: WebHost, attach: (FrameLayout) -> Unit, detach: () -> Unit) {
+    val form by web.loginForm.collectAsState()
     val prefs = LocalContext.current.getSharedPreferences("login", android.content.Context.MODE_PRIVATE)
     var user by remember { mutableStateOf(prefs.getString("user", "") ?: "") }
     var pass by remember { mutableStateOf("") }
@@ -126,17 +147,17 @@ private fun LoginPane(svc: MonitorService, attach: (FrameLayout) -> Unit, detach
     LaunchedEffect(form.ready) { if (form.ready && verified && !form.captcha && !form.sms) { verified = false; waiting = false } }
 
     if (useWeb) {
-        WebPane("网页登录", "这是美团经营宝的登录网页，滑块需要你自己拖。登录成功后自动收起。", "返回", { useWeb = false }, { svc.web.goto(startUrl()) }, attach, detach)
+        WebPane("网页登录", "这是美团经营宝的登录网页，滑块需要你自己拖。登录成功后自动收起。", "返回", { useWeb = false }, { web.goto(startUrl()) }, attach, detach)
         return
     }
     if (form.captcha) {
         // 滑块：露出美团的验证本身（页面其余部分用样式遮掉），用户自己拖
-        DisposableEffect(Unit) { svc.web.focusCaptcha(true); onDispose { svc.web.focusCaptcha(false) } }
+        DisposableEffect(Unit) { web.focusCaptcha(true); onDispose { web.focusCaptcha(false) } }
         WebPane("安全验证", "请拖动下面的滑块，完成美团的安全验证。完成后自动继续。", null, {}, null, attach, detach)
         return
     }
     if (form.sms) {
-        SmsPane(svc, form, onUseWeb = { useWeb = true })
+        SmsPane(web, form, onUseWeb = { useWeb = true })
         return
     }
     if (entering) {
@@ -167,7 +188,7 @@ private fun LoginPane(svc: MonitorService, attach: (FrameLayout) -> Unit, detach
         BigButton(if (waiting) "正在登录…" else if (!form.ready) "正在连接美团…" else "登录", enabled = can) {
             prefs.edit().putString("user", user.trim()).apply()
             msg = ""
-            if (svc.web.submitLogin(user.trim(), pass)) waiting = true
+            if (web.submitLogin(user.trim(), pass)) waiting = true
             else msg = "登录页还没准备好，请稍等几秒再试"
         }
         if (msg.isNotEmpty()) Note(msg, C.bad)
@@ -181,7 +202,7 @@ private fun LoginPane(svc: MonitorService, attach: (FrameLayout) -> Unit, detach
 
 /** 短信验证：美团在新设备登录时要求。按钮和输入都在应用里，由 login.js 照着操作美团的页面 */
 @Composable
-private fun SmsPane(svc: MonitorService, form: com.reviewmonitor.LoginForm, onUseWeb: () -> Unit) {
+private fun SmsPane(web: WebHost, form: com.reviewmonitor.LoginForm, onUseWeb: () -> Unit) {
     var code by remember { mutableStateOf("") }
     var sent by remember { mutableStateOf(false) }
     var checking by remember { mutableStateOf(false) }
@@ -200,11 +221,11 @@ private fun SmsPane(svc: MonitorService, form: com.reviewmonitor.LoginForm, onUs
                 Text("手机号", color = C.sub, fontSize = 12.sp)
                 Text(form.phone.ifEmpty { "—" }, color = C.text, fontSize = 18.sp, fontWeight = FontWeight.Medium)
             }
-            Pill(form.sendText.ifEmpty { "获取验证码" }, primary = !sent, enabled = form.sendEnabled) { sent = true; svc.web.smsSend() }
+            Pill(form.sendText.ifEmpty { "获取验证码" }, primary = !sent, enabled = form.sendEnabled) { sent = true; web.smsSend() }
         }
         Field(code, { v -> code = v.filter { it.isDigit() }.take(6) }, "验证码", enabled = !checking, numeric = true)
         BigButton(if (checking) "正在验证…" else "验证", enabled = code.length >= 4 && !checking) {
-            if (svc.web.smsVerify(code)) checking = true
+            if (web.smsVerify(code)) checking = true
         }
         if (form.error.isNotEmpty()) Note(form.error, C.bad)
         Text("点「获取验证码」后可能再出现一次滑块，需要你自己拖。验证码只用于这次验证，不会保存。", color = C.faint, fontSize = 12.sp, lineHeight = 17.sp)
@@ -214,7 +235,7 @@ private fun SmsPane(svc: MonitorService, form: com.reviewmonitor.LoginForm, onUs
     }
 }
 
-/** 把后台页面露出来：安全验证、网页登录、排查问题时用 */
+/** 把登录网页露出来：安全验证、网页登录时用 */
 @Composable
 private fun WebPane(title: String, hint: String, closeLabel: String?, onClose: () -> Unit, onReload: (() -> Unit)?, attach: (FrameLayout) -> Unit, detach: () -> Unit) {
     Column(Modifier.fillMaxSize()) {
@@ -237,7 +258,7 @@ private fun WebPane(title: String, hint: String, closeLabel: String?, onClose: (
 // ---------------- 主页 ----------------
 
 @Composable
-private fun MainPane(svc: MonitorService?, st: UiState, keep: KeepAlive, a: Actions, onOpenBackend: () -> Unit) {
+private fun MainPane(svc: MonitorService?, st: UiState, keep: KeepAlive, a: Actions) {
     var s by remember(svc) { mutableStateOf(svc?.engine?.settings() ?: defaultSettings()) }
     var msg by remember { mutableStateOf("") }
     var ok by remember { mutableStateOf(true) }
@@ -315,10 +336,11 @@ private fun MainPane(svc: MonitorService?, st: UiState, keep: KeepAlive, a: Acti
             SettingRow("退出登录", "清掉这台手机上的登录状态，监控暂停到重新登录；已提醒过的差评不会再提醒") {
                 Pill("退出登录") { askLogout = true }
             }
-            SettingRow("后台页面", "排查问题时才需要看") { Pill("打开", onClick = onOpenBackend) }
             SettingRow("停止监控并退出", "停掉后台检查，下次打开应用时重新开始") { Pill("退出", onClick = a.quit) }
         }
-        Text("数据只存在这台手机上，不上传任何服务器。", color = C.faint, fontSize = 12.sp, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
+        val ctx = LocalContext.current
+        val version = remember { runCatching { ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName }.getOrNull() ?: "" }
+        Text("数据只存在这台手机上，不上传任何服务器。\n版本 $version", color = C.faint, fontSize = 12.sp, lineHeight = 18.sp, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
     }
 }
 

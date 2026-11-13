@@ -1,4 +1,6 @@
 //! 后台页面：wry(WebView2) 作为子窗口嵌在 Slint 主窗口的内容区，注入 web/poller.js。
+//! 只负责登录界面与定位评价；评价数据由 Poller 经 [`crate::direct`] 直连接口拉取
+//!（cookie 从 WebView2 的 cookie 库取，含 httpOnly 的 bsid）。
 use rm_core::poller::{Call, IpcMsg, Page};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -20,6 +22,10 @@ pub struct Host {
     /// 用户是否正看着后台页（主窗口可见且在「后台页面」标签）
     pub user_visible: Rc<Cell<bool>>,
     pending_urls: Rc<RefCell<VecDeque<String>>>,
+    inbox: Inbox,
+    /// 直连请求在后台线程跑完，结果经这个 channel 回主线程并入 inbox
+    direct_tx: std::sync::mpsc::Sender<IpcMsg>,
+    direct_rx: std::sync::mpsc::Receiver<IpcMsg>,
 }
 
 impl Host {
@@ -29,6 +35,8 @@ impl Host {
         let handle = window.window_handle();
         let pending_urls: Rc<RefCell<VecDeque<String>>> = Rc::default();
         let pu = pending_urls.clone();
+        let ipc_inbox = inbox.clone();
+        let (direct_tx, direct_rx) = std::sync::mpsc::channel();
         let mut builder = WebViewBuilder::new_with_web_context(ctx);
         // 仅调试版：设了 RM_CDP_PORT 就开远程调试端口，方便用 tools/cdp.mjs 看已登录的页面
         #[cfg(debug_assertions)]
@@ -49,7 +57,7 @@ impl Host {
                 match serde_json::from_str::<IpcMsg>(body) {
                     Ok(m) => {
                         tracing::debug!("IPC <- {}", truncate(body, 300));
-                        inbox.borrow_mut().push_back(m);
+                        ipc_inbox.borrow_mut().push_back(m);
                     }
                     Err(e) => tracing::warn!("无法解析的 IPC 消息 ({e}): {}", truncate(body, 200)),
                 }
@@ -60,7 +68,14 @@ impl Host {
                 NewWindowResponse::Deny
             })
             .build_as_child(&handle)?;
-        Ok(Self { wv, user_visible: Rc::new(Cell::new(false)), pending_urls })
+        Ok(Self { wv, user_visible: Rc::new(Cell::new(false)), pending_urls, inbox, direct_tx, direct_rx })
+    }
+
+    /// ecom.meituan.com 的完整 cookie 头（含 httpOnly 的 bsid）。直接读 WebView2 的
+    /// cookie 库，与当前页面无关；cookie 全空（未登录）时返回 Some("")。
+    fn cookie_header(&self) -> Option<String> {
+        let cs = self.wv.cookies_for_url("https://ecom.meituan.com/").ok()?;
+        Some(cs.iter().map(|c| format!("{}={}", c.name(), c.value())).collect::<Vec<_>>().join("; "))
     }
 
     fn bounds_for(window: &slint::Window) -> Rect {
@@ -85,6 +100,11 @@ impl Host {
 
     /// 处理页面里请求打开的新窗口链接
     pub fn pump(&self) {
+        // 后台线程完成的直连请求结果并入 IPC inbox，走同一条 on_msg 通道
+        while let Ok(m) = self.direct_rx.try_recv() {
+            tracing::debug!("直连回传 {} kind={}", m.req_id.as_deref().unwrap_or_default(), m.kind);
+            self.inbox.borrow_mut().push_back(m);
+        }
         while let Some(u) = self.pending_urls.borrow_mut().pop_front() {
             let _ = self.wv.load_url(&u);
         }
@@ -102,11 +122,15 @@ impl Host {
 
 impl Page for Host {
     fn call(&self, req_id: &str, call: &Call) {
-        let js = call.to_js(req_id);
-        tracing::debug!("call {req_id} {call:?}");
-        if let Err(e) = self.wv.evaluate_script(&js) {
-            tracing::warn!("evaluate_script 失败: {e}");
-        }
+        tracing::debug!("call {req_id} {call:?}（直连）");
+        let Some(cookie) = self.cookie_header() else {
+            self.inbox.borrow_mut().push_back(crate::direct::cookie_unavailable(req_id, call));
+            return;
+        };
+        let tx = self.direct_tx.clone();
+        // 网络 I/O 不进 UI 线程；结果经 direct_rx → inbox 回给 Poller
+        let (req_id, call) = (req_id.to_string(), call.clone());
+        std::thread::spawn(move || { let _ = tx.send(crate::direct::perform(&req_id, &call, &cookie)); });
     }
 
     fn goto_reviews(&self) {

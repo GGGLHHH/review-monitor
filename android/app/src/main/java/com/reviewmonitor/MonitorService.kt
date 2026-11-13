@@ -72,7 +72,8 @@ class RoundLog(private val file: java.io.File) {
 }
 
 /**
- * 常驻监控服务：持有后台页 WebView 和 rm-core 的 Engine，每秒驱动一次。
+ * 常驻监控服务：持有 rm-core 的 Engine，每秒驱动一次。接口请求由 Rust 直接发，不经过网页。
+ * 只有需要登录时才创建登录用的 WebView（[web]），登录成功、cookie 交给 Engine 后就销毁它。
  * 熄屏后 Handler 会跟着 CPU 睡着，所以每轮检查前用闹钟把手机叫醒，检查期间持有 wake lock，查完就放。
  */
 class MonitorService : Service() {
@@ -119,8 +120,9 @@ class MonitorService : Service() {
     private val binder = LocalBinder()
     private val main = Handler(Looper.getMainLooper())
 
-    lateinit var web: WebHost
-        private set
+    /** 登录用的 WebView：只在需要登录时存在，界面据此显示登录页 */
+    val webFlow = MutableStateFlow<WebHost?>(null)
+    val web: WebHost? get() = webFlow.value
     var engine: Engine? = null
         private set
     val ui = MutableStateFlow(UiState())
@@ -129,6 +131,8 @@ class MonitorService : Service() {
     private var alarmAt = 0L
     private var lastOngoing = ""
     private var stopped = false
+    /** 退出登录时正在清 cookie：清完之前别开登录网页，否则它会带着旧 cookie 直接「登录成功」 */
+    private var clearing = false
     private lateinit var rounds: RoundLog
 
     override fun onCreate() {
@@ -140,9 +144,14 @@ class MonitorService : Service() {
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "review-monitor:round")
             .apply { setReferenceCounted(false) }
         rounds = RoundLog(java.io.File(filesDir, "rounds.log"))
-        web = WebHost(this, startUrl()) { json -> engine?.onMessage(json) }
         try {
-            engine = Engine(filesDir.absolutePath, EngineHost())
+            engine = Engine(filesDir.absolutePath, EngineHost()).also { e ->
+                // 从旧版升级上来（以前 cookie 只在 WebView 里）：直接沿用，不用重新登录
+                if (!e.hasCredentials()) {
+                    val c = WebHost.storedCookies()
+                    if (WebHost.hasSession(c) && e.setCredentials(c, WebHost.desktopUa(this))) Log.i(TAG, "沿用 WebView 里已有的登录 cookie")
+                }
+            }
         } catch (e: Throwable) {
             Log.e(TAG, "Engine 启动失败", e)
             ui.value = UiState(fatal = "启动失败：${e.message}")
@@ -165,7 +174,7 @@ class MonitorService : Service() {
         main.removeCallbacks(ticker)
         cancelAlarm()
         if (wake.isHeld) wake.release()
-        web.destroy()
+        closeWeb()
         engine?.close()
         engine = null
         instance = null
@@ -197,16 +206,47 @@ class MonitorService : Service() {
         keepAwake(st)
         e.takeListDirty()
         e.takeAttention() // 掉线：core 已经发了「需要登录」通知，界面打开时会直接显示登录页
+        syncWeb(st)
         if (st.login == 2) rounds.markLoggedOut(System.currentTimeMillis())
         else if (st.lastOkMs > 0) rounds.add(st.lastOkMs)
         ui.value = ui.value.copy(status = st, keep = rounds.stats(System.currentTimeMillis()))
         updateOngoing(st)
     }
 
-    /** 「退出登录」：先让监控暂停（之后到的回音一律丢掉），再清登录状态 */
+    /** 需要登录就开登录网页；确认登录成功就把它关掉（关之前再取一次 cookie） */
+    private fun syncWeb(st: StatusInfo) {
+        when {
+            st.login == 2 && web == null && !clearing -> {
+                Log.i(TAG, "需要登录，打开登录网页")
+                webFlow.value = WebHost(this, startUrl()) { cookie, ua -> onCredentials(cookie, ua) }
+            }
+            st.login == 1 && web != null -> {
+                web?.harvestNow()
+                closeWeb()
+            }
+        }
+    }
+
+    private fun closeWeb() {
+        val w = web ?: return
+        webFlow.value = null
+        w.destroy()
+    }
+
+    /** 登录网页进到经营宝后台了：cookie 交给 Engine，马上探测登录 */
+    private fun onCredentials(cookie: String, ua: String) {
+        if (engine?.setCredentials(cookie, ua) == true) {
+            main.removeCallbacks(ticker)
+            main.post(ticker)
+        }
+    }
+
+    /** 「退出登录」：先让监控暂停、丢掉保存的 cookie，再清 WebView 里的登录状态；清完下一拍会打开登录网页 */
     fun logout() {
         engine?.logout()
-        web.clearLogin()
+        closeWeb()
+        clearing = true
+        WebHost.clearLoginData { main.post { clearing = false } }
         main.removeCallbacks(ticker)
         main.post(ticker)
     }
@@ -290,9 +330,6 @@ class MonitorService : Service() {
 
     /** rm-core 回调到这里。都在主线程、Engine 持锁时调用，不要在里面回调 Engine */
     private inner class EngineHost : Host {
-        override fun evalJs(js: String) { web.eval(js) }
-        override fun gotoUrl(url: String) { web.goto(url) }
-        override fun userVisible(): Boolean = web.userVisible
         override fun notify(alert: AlertInfo): Boolean = showAlert(this@MonitorService, alert)
     }
 }

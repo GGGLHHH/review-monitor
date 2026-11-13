@@ -1,13 +1,17 @@
 //! rm-core 的 UniFFI 门面：给安卓（Kotlin）用。
 //!
-//! Kotlin 提供一个 [`Host`]（在 WebView 里执行 JS、跳转、发系统通知），
-//! 拿到一个 [`Engine`]，在主线程上定时调 `tick()`，把 poller.js 的回传交给 `on_message()`。
-//! 业务逻辑全部在 rm-core 里，和电脑版完全同一套。
+//! 接口请求由 Rust 直接发（rm-core 的 http 模块，和电脑版同一套），不经过 WebView。
+//! Kotlin 只做两件事：提供一个能发系统通知的 [`Host`]；需要登录时开 WebView 让用户登录，
+//! 登录完把 cookie 交给 [`Engine::set_credentials`]，然后就可以把 WebView 销毁。
+//! 主线程上定时调 `tick()` 驱动轮询。业务逻辑全部在 rm-core 里。
 use chrono::Local;
 use rm_core::activate::{self, Activation};
 use rm_core::config::Config;
+use rm_core::browse;
+use rm_core::http::{Client, ThreadTransport};
+use std::collections::{BTreeMap, HashMap};
 use rm_core::notify::{fmt_star, Alert, AlertKind, Dispatcher, Notifier};
-use rm_core::poller::{self, IpcMsg, Login, Page, Poller};
+use rm_core::poller::{self, Login, Poller};
 use rm_core::store::Store;
 use rm_core::Platform;
 use std::path::PathBuf;
@@ -18,15 +22,9 @@ uniffi::setup_scaffolding!();
 
 // ---------------- Kotlin 实现的宿主 ----------------
 
-/// 宿主能力。所有方法都可能在持锁时被调用，实现里**不要**同步回调 Engine。
+/// 宿主能力。可能在持锁时被调用，实现里**不要**同步回调 Engine。
 #[uniffi::export(with_foreign)]
 pub trait Host: Send + Sync {
-    /// 在后台页 WebView 里执行 JS（异步执行即可）
-    fn eval_js(&self, js: String);
-    /// 让后台页打开这个地址
-    fn goto_url(&self, url: String);
-    /// 用户此刻是否正看着后台页
-    fn user_visible(&self) -> bool;
     /// 发一条系统通知。返回 false 表示没发出去（会按发件箱规则重试）
     fn notify(&self, alert: AlertInfo) -> bool;
 }
@@ -76,21 +74,6 @@ impl Notifier for HostNotifier {
     }
 }
 
-struct HostPage<'a>(&'a Arc<dyn Host>);
-impl Page for HostPage<'_> {
-    fn call(&self, req_id: &str, call: &poller::Call) {
-        tracing::debug!("call {req_id} {call:?}");
-        self.0.eval_js(call.to_js(req_id));
-    }
-    fn goto_reviews(&self) {
-        tracing::info!("让后台页回到评价页");
-        self.0.goto_url(poller::START_URL.into());
-    }
-    fn user_visible(&self) -> bool {
-        self.0.user_visible()
-    }
-}
-
 // ---------------- 给界面的数据 ----------------
 
 #[derive(uniffi::Record, Debug, Clone)]
@@ -123,6 +106,118 @@ pub struct ReviewRow {
     pub replied: bool,
     pub bad: bool,
     pub read: bool,
+}
+
+// ---------------- 评价页（按网页版筛选直接查经营宝）----------------
+
+/// 一组筛选（回复状态 / 星级 / 来源 / 用户 / 时间），options 就是发给接口的值
+#[derive(uniffi::Record, Debug, Clone)]
+pub struct FilterGroupInfo {
+    pub key: String,
+    pub label: String,
+    pub options: Vec<String>,
+    pub default_value: String,
+}
+
+/// 网页星级档位 band（「全部」「中差评」…）里能细筛哪几星
+#[uniffi::export]
+pub fn review_star_options(is_mt: bool, band: String) -> Vec<u8> {
+    let p = if is_mt { Platform::Meituan } else { Platform::Dianping };
+    browse::stars_in_band(p, &band)
+}
+
+/// 该平台网页版上的筛选项（顺序同网页）
+#[uniffi::export]
+pub fn review_filters(is_mt: bool) -> Vec<FilterGroupInfo> {
+    let p = if is_mt { Platform::Meituan } else { Platform::Dianping };
+    browse::filter_groups(p).into_iter().map(|g| FilterGroupInfo {
+        key: g.key.into(),
+        label: g.label.into(),
+        options: g.options.into_iter().map(String::from).collect(),
+        default_value: g.default.into(),
+    }).collect()
+}
+
+#[derive(uniffi::Record, Debug, Clone)]
+pub struct ReviewQuery {
+    pub is_mt: bool,
+    /// 从 1 开始
+    pub page: u32,
+    /// filterKey → 选中的值；没给的按默认
+    pub filters: HashMap<String, String>,
+    /// 只看这几星（1~5，半星归低一档）；空 = 不细筛。网页版没有这个，拉回来后本地筛
+    pub stars: Vec<u8>,
+}
+
+#[derive(uniffi::Record, Debug, Clone)]
+pub struct ReplyInfo {
+    pub reply_id: i64,
+    pub follow_id: i64,
+    pub from_merchant: bool,
+    pub name: String,
+    pub content: String,
+    pub time: String,
+}
+
+#[derive(uniffi::Record, Debug, Clone)]
+pub struct FeedbackInfo {
+    pub key: String,
+    pub is_mt: bool,
+    pub feedback_id: i64,
+    pub user_name: String,
+    /// 「2.5★」
+    pub star: String,
+    pub star_value: f32,
+    pub sub_scores: String,
+    pub time: String,
+    pub content: String,
+    /// 缩略图
+    pub pictures: Vec<String>,
+    /// 大图（和 pictures 一一对应）
+    pub pictures_full: Vec<String>,
+    pub video_count: u32,
+    pub source: String,
+    pub deal_name: String,
+    pub returned_customer: bool,
+    pub replied: bool,
+    pub replies: Vec<ReplyInfo>,
+}
+
+#[derive(uniffi::Record, Debug, Clone)]
+pub struct FeedbackPageInfo {
+    pub total: u32,
+    pub page: u32,
+    pub page_size: u32,
+    /// 这一页接口实际返回了几条（细筛后 items 可能更少，翻页按这个算）
+    pub scanned: u32,
+    pub items: Vec<FeedbackInfo>,
+}
+
+impl From<browse::Feedback> for FeedbackInfo {
+    fn from(f: browse::Feedback) -> Self {
+        Self {
+            key: f.key,
+            is_mt: f.platform == Platform::Meituan,
+            feedback_id: f.feedback_id,
+            user_name: f.user_name,
+            star: format!("{}★", fmt_star(f.star)),
+            star_value: f.star,
+            sub_scores: f.sub_scores,
+            time: f.time,
+            content: f.content,
+            pictures: f.pictures,
+            pictures_full: f.pictures_full,
+            video_count: f.video_count,
+            source: f.source,
+            deal_name: f.deal_name,
+            returned_customer: f.returned_customer,
+            replied: f.replied,
+            replies: f.replies.into_iter().map(|r| ReplyInfo {
+                reply_id: r.reply_id, follow_id: r.follow_id, from_merchant: r.from_merchant,
+                name: r.name, content: r.content, time: r.time,
+            }).collect(),
+        }
+    }
 }
 
 /// 设置页的全部配置项（和电脑版设置页一一对应）
@@ -188,8 +283,6 @@ pub struct Launch {
     pub kind: String,
     /// kind=review 时是评价 key（dp:123），否则为空
     pub review_key: String,
-    /// kind=review 时，在后台页里执行它就会定位并高亮这条评价
-    pub reveal_js: String,
 }
 
 /// 解析 review-monitor:// 链接；不是本程序的链接返回 None
@@ -207,17 +300,14 @@ pub fn launch_for_review(key: String) -> Option<Launch> {
 
 fn launch_of(a: &Activation) -> Launch {
     match a {
-        Activation::Open => Launch { kind: "open".into(), review_key: String::new(), reveal_js: String::new() },
-        Activation::Backend => Launch { kind: "backend".into(), review_key: String::new(), reveal_js: String::new() },
-        Activation::Review { platform, feedback_id } => Launch {
-            kind: "review".into(),
-            review_key: a.review_key().unwrap_or_default(),
-            reveal_js: poller::reveal_js(*platform, *feedback_id),
-        },
+        Activation::Open => Launch { kind: "open".into(), review_key: String::new() },
+        // backend：去登录
+        Activation::Backend => Launch { kind: "backend".into(), review_key: String::new() },
+        Activation::Review { .. } => Launch { kind: "review".into(), review_key: a.review_key().unwrap_or_default() },
     }
 }
 
-/// 后台页的起始地址
+/// 登录网页的起始地址（没登录会跳到登录页，登录完跳回经营宝后台）
 #[uniffi::export]
 pub fn start_url() -> String {
     poller::START_URL.into()
@@ -255,6 +345,7 @@ impl From<anyhow::Error> for EngineError {
 
 struct Inner {
     poller: Poller,
+    net: ThreadTransport,
     host: Arc<dyn Host>,
     config_path: PathBuf,
     cfg_warn: Option<String>,
@@ -263,7 +354,11 @@ struct Inner {
 #[derive(uniffi::Object)]
 pub struct Engine {
     inner: Mutex<Inner>,
+    /// 评价页的查询用：在调用方的线程里同步发，不经过轮询，也不占着 inner 的锁
+    client: Client,
 }
+
+const BROWSE_PAGE_SIZE: u32 = 20;
 
 /// 轮询用的单调时钟。安卓上 Instant 走 CLOCK_MONOTONIC，深睡时不走；
 /// 这里按 CLOCK_BOOTTIME（含睡眠时间）推算，熄屏几分钟后醒来，到点的检查马上就会开始。
@@ -319,10 +414,43 @@ fn init_logging(dir: &std::path::Path) {
     });
 }
 
+fn fail(m: &str) -> EngineError {
+    EngineError::Failed { msg: m.into() }
+}
+
 impl Engine {
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         // 某次调用 panic 了也别让整个程序跟着锁死
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 评价页自己发的请求：拿一份当前 cookie，在调用方线程里同步发（不占着锁），
+    /// 回来后把续发的 cookie 记下；没登录、登录失效、网络错误都在这里变成中文错误。
+    fn direct(
+        &self,
+        req_id: &str,
+        make: impl FnOnce(&Inner) -> Result<poller::Call, EngineError>,
+    ) -> Result<rm_core::http::HttpReply, EngineError> {
+        let req = {
+            let g = self.lock();
+            if !g.poller.has_credentials() { return Err(fail("还没登录")); }
+            make(&g)?.to_http(g.poller.credentials(), now_ms())
+        };
+        let reply = self.client.call(req_id, &req);
+        {
+            // 请求编号对不上轮询的，on_reply 只会记 cookie，不影响轮询
+            let mut g = self.lock();
+            g.poller.on_reply(&reply, mono_now(), now_ms());
+            if reply.error.is_none() && browse::is_login_lost(reply.status, &reply.body) {
+                g.poller.check_now(mono_now());
+                return Err(fail("登录已失效，正在重新检查登录"));
+            }
+        }
+        match &reply.error {
+            Some(e) if e == "timeout" => Err(fail("经营宝没有响应（超时），稍后再试")),
+            Some(_) => Err(fail("连不上经营宝，检查一下网络")),
+            None => Ok(reply),
+        }
     }
 }
 
@@ -341,32 +469,76 @@ impl Engine {
         let disp = dispatcher(&cfg, &host);
         tracing::info!("Engine 启动，数据目录 {}", dir.display());
         let poller = Poller::new(cfg, store, disp, mono_now());
-        Ok(Arc::new(Self { inner: Mutex::new(Inner { poller, host, config_path, cfg_warn }) }))
+        Ok(Arc::new(Self {
+            inner: Mutex::new(Inner { poller, net: ThreadTransport::default(), host, config_path, cfg_warn }),
+            client: Client::default(),
+        }))
     }
 
-    /// 主线程上每 0.5–1 秒调一次
+    /// 评价页：按网页版的筛选查一页评价（只读）。**会阻塞到接口返回（最长 15 秒），要在后台线程里调。**
+    /// 没登录、登录失效、网络错误都以中文错误返回；登录失效时顺便让监控马上复查登录。
+    pub fn fetch_reviews(&self, q: ReviewQuery) -> Result<FeedbackPageInfo, EngineError> {
+        let platform = if q.is_mt { Platform::Meituan } else { Platform::Dianping };
+        let page = q.page.max(1);
+        let mut stars = q.stars.clone();
+        stars.sort_unstable();
+        stars.dedup();
+        stars.retain(|s| (1..=5).contains(s));
+        let reply = self.direct("browse", |g| {
+            let Some(poi) = g.poller.cached_pois().into_iter().next() else {
+                return Err(fail("还没取到门店，等第一次检查完成再试"));
+            };
+            let mut picked: BTreeMap<String, String> = q.filters.into_iter().collect();
+            let band = picked.get("starType").cloned().unwrap_or_else(|| "全部".into());
+            picked.insert("starType".into(), browse::star_band_for(platform, &band, &stars));
+            let body = browse::list_body(platform, &poi, page, BROWSE_PAGE_SIZE, &picked, Local::now());
+            Ok(poller::Call::List { platform, body })
+        })?;
+        if reply.status != Some(200) {
+            return Err(fail(&format!("经营宝返回错误（HTTP {}）", reply.status.unwrap_or(0))));
+        }
+        let p = browse::parse_page(platform, &reply.body, Local::now()).map_err(|e| fail(&e.to_string()))?;
+        let scanned = p.items.len() as u32;
+        let items = p.items.into_iter().filter(|f| stars.is_empty() || stars.contains(&browse::star_bucket(f.star)));
+        Ok(FeedbackPageInfo { total: p.total, page, page_size: BROWSE_PAGE_SIZE, scanned, items: items.map(Into::into).collect() })
+    }
+
+    /// 回复一条评价（key 形如 `dp:3550270840`）。**写操作，回复会公开显示在美团 / 点评上**，
+    /// 只能由用户在评价页亲手点「发送」触发。会阻塞到接口返回，要在后台线程里调。成功返回空，失败返回中文原因。
+    pub fn reply_review(&self, key: String, content: String) -> Result<(), EngineError> {
+        let (platform, feedback_id) = activate::split_key(&key).ok_or_else(|| fail("评价编号不对"))?;
+        let body = browse::reply_body(platform, feedback_id, &content).map_err(|e| fail(&e))?;
+        let reply = self.direct("reply", |_| Ok(poller::Call::Reply { body }))?;
+        browse::reply_outcome(reply.status, &reply.body).map_err(|e| fail(&e))?;
+        tracing::info!("已回复评价 {key}（{} 字）", content.trim().chars().count());
+        Ok(())
+    }
+
+    /// 主线程上每 0.5–1 秒调一次：收已经回来的接口结果，到点了就发下一个请求（请求在后台线程里跑，不阻塞）
     pub fn tick(&self) {
         let mut g = self.lock();
-        let Inner { poller, host, .. } = &mut *g;
-        poller.tick(&HostPage(host), mono_now(), now_ms());
+        let Inner { poller, net, .. } = &mut *g;
+        let (now, ms) = (mono_now(), now_ms());
+        for r in net.drain() { poller.on_reply(&r, now, ms); }
+        poller.tick(net, now, ms);
     }
 
-    /// poller.js 通过 window.ipc.postMessage 回传的原始 JSON
-    pub fn on_message(&self, json: String) {
-        let msg: IpcMsg = match serde_json::from_str(&json) {
-            Ok(m) => m,
-            Err(e) => { tracing::warn!("IPC 解析失败: {e}"); return; }
-        };
-        let mut g = self.lock();
-        let Inner { poller, host, .. } = &mut *g;
-        poller.on_msg(&msg, &HostPage(host), mono_now(), now_ms());
+    /// 登录网页里取到的 cookie（`CookieManager.getCookie` 的原样输出，含 httpOnly）和网页的 UA。
+    /// 空的不收，返回 false。掉线状态下会马上用它探测登录。
+    pub fn set_credentials(&self, cookie_header: String, user_agent: String) -> bool {
+        self.lock().poller.set_credentials(&cookie_header, &user_agent, mono_now())
+    }
+
+    /// 有没有保存的登录 cookie（没有就得开登录网页）
+    pub fn has_credentials(&self) -> bool {
+        self.lock().poller.has_credentials()
     }
 
     pub fn check_now(&self) {
         self.lock().poller.check_now(mono_now());
     }
 
-    /// 主动退出登录：登录状态由界面清掉（cookie、页面存储），这里让监控暂停、不发提醒
+    /// 主动退出登录：丢掉保存的 cookie，监控暂停、不发提醒。网页里的 cookie 由界面清掉
     pub fn logout(&self) {
         self.lock().poller.logout(mono_now(), now_ms());
     }
@@ -436,7 +608,7 @@ impl Engine {
         std::mem::take(&mut self.lock().poller.list_dirty)
     }
 
-    /// 掉线等需要用户处理（取一次就清掉）：界面应切到后台页
+    /// 掉线等需要用户处理（取一次就清掉）：界面应切到登录页
     pub fn take_attention(&self) -> bool {
         std::mem::take(&mut self.lock().poller.attention)
     }
@@ -476,13 +648,9 @@ mod tests {
 
     #[derive(Default)]
     struct FakeHost {
-        js: M<Vec<String>>,
         notes: M<Vec<AlertInfo>>,
     }
     impl Host for FakeHost {
-        fn eval_js(&self, js: String) { self.js.lock().unwrap().push(js); }
-        fn goto_url(&self, _url: String) {}
-        fn user_visible(&self) -> bool { false }
         fn notify(&self, alert: AlertInfo) -> bool { self.notes.lock().unwrap().push(alert); true }
     }
 
@@ -505,7 +673,6 @@ mod tests {
     fn launch_parsing() {
         let l = parse_launch("review-monitor://open?review=dp:3550718756".into()).unwrap();
         assert_eq!((l.kind.as_str(), l.review_key.as_str()), ("review", "dp:3550718756"));
-        assert!(l.reveal_js.contains("reveal('dianping','3550718756')"));
         assert_eq!(parse_launch("review-monitor://open?page=backend".into()).unwrap().kind, "backend");
         assert!(parse_launch("https://x".into()).is_none());
         assert_eq!(launch_for_review("mt:1".into()).unwrap().kind, "review");
@@ -516,13 +683,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let host = Arc::new(FakeHost::default());
         let e = Engine::new(dir.path().display().to_string(), host.clone()).unwrap();
+        // 还没登录过：直接进「需要登录」，不发请求、不提醒
+        assert!(!e.has_credentials());
         e.check_now();
         e.tick();
-        let js = host.js.lock().unwrap().clone();
-        assert!(js.iter().any(|j| j.contains("__rm.whoami")), "{js:?}");
-        // 坏 JSON 不会 panic
-        e.on_message("not json".into());
-        assert_eq!(e.status().login, 0);
+        assert_eq!(e.status().login, 2);
+        assert!(e.take_attention());
+        assert!(host.notes.lock().unwrap().is_empty());
+        assert!(!e.set_credentials(" ".into(), "UA".into()));
+        // 评价页：没登录时直接报错，不发请求
+        let q = ReviewQuery { is_mt: true, page: 1, filters: HashMap::new(), stars: vec![1] };
+        assert!(e.fetch_reviews(q).unwrap_err().to_string().contains("还没登录"));
+        // 回复：先校验内容和编号，再看登录；都不会真的发出去
+        assert!(e.reply_review("dp:1".into(), "  ".into()).unwrap_err().to_string().contains("不能为空"));
+        assert!(e.reply_review("xx".into(), "谢谢".into()).unwrap_err().to_string().contains("编号"));
+        assert!(e.reply_review("dp:1".into(), "谢谢".into()).unwrap_err().to_string().contains("还没登录"));
+        assert_eq!(review_filters(false).len(), 5);
+        assert_eq!(review_filters(true)[0].default_value, "未回复");
+        // 交来 cookie 后存进库，重开 Engine 还在；退出登录就清掉
+        assert!(e.set_credentials("bsid=1; a=2".into(), "UA".into()));
+        assert!(e.has_credentials());
+        drop(e);
+        let e = Engine::new(dir.path().display().to_string(), host.clone()).unwrap();
+        assert!(e.has_credentials());
+        e.logout();
+        assert!(!e.has_credentials());
         assert!(e.reviews(true, 10).is_empty());
         // 保存非法设置被拒
         let mut s = e.settings();
